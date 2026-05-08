@@ -111,4 +111,12 @@ match_unstable_error = True
 use_detached_boxes_dec_out = False
 dn_scalar = 100
 
-use_coco_eval = True
+use_coco_eval = False
+label_list = [
+    "clamp overholt geissend",
+    "dissecting scissor",
+    "ligature clamp debakey",
+    "needle holder debakey",
+    "peritoneum clamp baby mikulicz",
+    "surgical scissor",
+]

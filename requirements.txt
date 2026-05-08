@@ -16,3 +16,4 @@ pycocotools
 pyyaml>3.10
 colorlog
 jsonlines
+tqdm

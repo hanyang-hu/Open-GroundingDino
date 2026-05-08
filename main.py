@@ -58,6 +58,10 @@ def get_args_parser():
     parser.add_argument('--find_unused_params', action='store_true')
     parser.add_argument('--save_results', action='store_true')
     parser.add_argument('--save_log', action='store_true')
+    parser.add_argument('--use_tensorboard', action='store_true',
+                        help='enable TensorBoard logging on main process')
+    parser.add_argument('--tensorboard_dir', default='',
+                        help='TensorBoard log directory. Default: <output_dir>/tensorboard')
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -131,6 +135,16 @@ def main(args):
     logger.info('rank: {}'.format(args.rank))
     logger.info('local_rank: {}'.format(args.local_rank))
     logger.info("args: " + str(args) + '\n')
+
+    tb_writer = None
+    if args.use_tensorboard and utils.is_main_process():
+        tb_log_dir = args.tensorboard_dir if args.tensorboard_dir else os.path.join(args.output_dir, "tensorboard")
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_writer = SummaryWriter(log_dir=tb_log_dir)
+            logger.info(f"TensorBoard enabled. log_dir={tb_log_dir}")
+        except Exception as e:
+            logger.warning(f"TensorBoard disabled because SummaryWriter initialization failed: {e}")
 
     device = torch.device(args.device)
     # fix the seed for reproducibility
@@ -268,6 +282,8 @@ def main(args):
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        if tb_writer is not None:
+            tb_writer.close()
 
         return
     
@@ -341,6 +357,13 @@ def main(args):
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
+            if tb_writer is not None:
+                for k, v in log_stats.items():
+                    if isinstance(v, (int, float)):
+                        tb_writer.add_scalar(k, v, epoch)
+                lr_val = optimizer.param_groups[0]["lr"]
+                tb_writer.add_scalar("train/lr", lr_val, epoch)
+
             # for evaluation logs
             if coco_evaluator is not None:
                 (output_dir / 'eval').mkdir(exist_ok=True)
@@ -354,6 +377,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if tb_writer is not None:
+        tb_writer.close()
 
     # remove the copied files.
     copyfilelist = vars(args).get('copyfilelist')

@@ -6,6 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
+# Pre-trained checkpoints
+content/
+
+# Output
+output/
+
+# Dataset
+data/
+
 # Distribution / packaging
 .Python
 build/

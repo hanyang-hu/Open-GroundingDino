@@ -3,7 +3,7 @@ data_aug_max_size = 1333
 data_aug_scales2_resize = [400, 500, 600]
 data_aug_scales2_crop = [384, 600]
 data_aug_scale_overlap = None
-batch_size = 4
+batch_size = 2 # 2 for local test, set higher for actual training
 modelname = 'groundingdino'
 backbone = 'swin_T_224_1k'
 position_embedding = 'sine'
@@ -56,7 +56,7 @@ lr_linear_proj_names = ['ref_point_head', 'sampling_offsets']
 weight_decay = 0.0001
 param_dict_type = 'ddetr_in_mmdet'
 ddetr_lr_param = False
-epochs = 15
+epochs = 20
 lr_drop = 4
 save_checkpoint_interval = 1
 clip_max_norm = 0.1
@@ -114,5 +114,13 @@ use_ema = False
 ema_decay = 0.9997
 ema_epoch = 0
 use_detached_boxes_dec_out = False
-use_coco_eval = True
+use_coco_eval = False
+label_list = [
+    "clamp overholt geissend",
+    "dissecting scissor",
+    "ligature clamp debakey",
+    "needle holder debakey",
+    "peritoneum clamp baby mikulicz",
+    "surgical scissor",
+]
 dn_scalar = 100
