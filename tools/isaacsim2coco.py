@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+from util.slconfig import SLConfig
 
 
 DEFAULT_CATEGORIES = {
@@ -18,6 +19,14 @@ DEFAULT_CATEGORIES = {
     5: "peritoneum clamp baby mikulicz",
     6: "surgical scissor",
 }
+
+
+def categories_from_cfg(cfg_path: Path):
+    cfg = SLConfig.fromfile(str(cfg_path))
+    if not hasattr(cfg, "label_list"):
+        raise ValueError(f"'label_list' not found in cfg: {cfg_path}")
+    label_list = list(cfg.label_list)
+    return {i + 1: name for i, name in enumerate(label_list)}
 
 
 def parse_name(path: Path, kind: str):
@@ -187,6 +196,12 @@ def main():
         action="store_true",
         help="Write COCO annotations into split folders as _annotations.coco.json (Aquarium style)",
     )
+    parser.add_argument(
+        "--cfg",
+        type=Path,
+        default=None,
+        help="Optional cfg path. If set, categories are built from cfg.label_list (1-based ids).",
+    )
     args = parser.parse_args()
 
     if not (0.0 < args.train_ratio < 1.0):
@@ -213,8 +228,10 @@ def main():
     train_pairs = materialize_split(train_pairs, train_img_dir)
     val_pairs = materialize_split(val_pairs, val_img_dir)
 
-    train_coco = convert_subset(train_pairs, args.dataset_root, DEFAULT_CATEGORIES, train_img_dir)
-    val_coco = convert_subset(val_pairs, args.dataset_root, DEFAULT_CATEGORIES, val_img_dir)
+    category_map = categories_from_cfg(args.cfg) if args.cfg else DEFAULT_CATEGORIES
+
+    train_coco = convert_subset(train_pairs, args.dataset_root, category_map, train_img_dir)
+    val_coco = convert_subset(val_pairs, args.dataset_root, category_map, val_img_dir)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train_out = args.output_dir / "train.json"

@@ -7,9 +7,11 @@ import random
 import time
 from pathlib import Path
 import os, sys
+import glob
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+from torchvision.utils import draw_bounding_boxes
 
 from util.get_param_dicts import get_param_dict
 from util.logger import setup_logger
@@ -86,6 +88,71 @@ def build_model_main(args):
     return model, criterion, postprocessors
 
 
+def _build_eval_caption(args):
+    if args.use_coco_eval:
+        from pycocotools.coco import COCO
+        coco = COCO(args.coco_val_path)
+        category_dict = coco.loadCats(coco.getCatIds())
+        cat_list = [item["name"] for item in category_dict]
+    else:
+        cat_list = args.label_list
+    return " . ".join(cat_list) + " .", cat_list
+
+
+@torch.no_grad()
+def log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoch, max_images=4, score_thr=0.30):
+    if tb_writer is None:
+        return
+    model.eval()
+    caption, cat_list = _build_eval_caption(args)
+
+    try:
+        samples, _ = next(iter(data_loader_val))
+    except StopIteration:
+        return
+
+    samples = samples.to(device)
+    bs = samples.tensors.shape[0]
+    input_captions = [caption] * bs
+    outputs = model(samples, captions=input_captions)
+
+    pred_logits = outputs["pred_logits"].sigmoid().detach().cpu()  # [B, NQ, 256]
+    pred_boxes = outputs["pred_boxes"].detach().cpu()              # [B, NQ, 4], cxcywh in [0,1]
+    vis_images = samples.tensors.detach().cpu()
+
+    n_vis = min(max_images, bs)
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=vis_images.dtype).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=vis_images.dtype).view(3, 1, 1)
+
+    for i in range(n_vis):
+        img = vis_images[i] * std + mean
+        img = (img.clamp(0, 1) * 255).to(torch.uint8)
+        h, w = img.shape[-2], img.shape[-1]
+
+        scores, labels = pred_logits[i].max(dim=1)
+        keep = scores > score_thr
+        boxes = pred_boxes[i][keep]
+        scores = scores[keep]
+        labels = labels[keep]
+
+        if boxes.numel() > 0:
+            boxes_xyxy = boxes.clone()
+            boxes_xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2.0) * w
+            boxes_xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2.0) * h
+            boxes_xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2.0) * w
+            boxes_xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2.0) * h
+            boxes_xyxy[:, [0, 2]] = boxes_xyxy[:, [0, 2]].clamp(0, w - 1)
+            boxes_xyxy[:, [1, 3]] = boxes_xyxy[:, [1, 3]].clamp(0, h - 1)
+
+            text_labels = []
+            for lbl, sc in zip(labels.tolist(), scores.tolist()):
+                cls_name = cat_list[lbl] if 0 <= lbl < len(cat_list) else str(lbl)
+                text_labels.append(f"{cls_name}:{sc:.2f}")
+            img = draw_bounding_boxes(img, boxes_xyxy, labels=text_labels, width=2)
+
+        tb_writer.add_image(f"val/pred_{i}", img, epoch)
+
+
 def main(args):
     
 
@@ -140,6 +207,13 @@ def main(args):
     if args.use_tensorboard and utils.is_main_process():
         tb_log_dir = args.tensorboard_dir if args.tensorboard_dir else os.path.join(args.output_dir, "tensorboard")
         try:
+            import socket
+            # Work around TensorBoard Unicode path issues on some Windows setups.
+            _orig_gethostname = socket.gethostname
+            def _safe_gethostname():
+                host = _orig_gethostname()
+                return host.encode("ascii", errors="ignore").decode("ascii") or "host"
+            socket.gethostname = _safe_gethostname
             from torch.utils.tensorboard import SummaryWriter
             tb_writer = SummaryWriter(log_dir=tb_log_dir)
             logger.info(f"TensorBoard enabled. log_dir={tb_log_dir}")
@@ -240,7 +314,7 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(clean_state_dict(checkpoint['model']),strict=False)
 
 
@@ -251,7 +325,7 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
 
     if (not args.resume) and args.pretrain_model_path:
-        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu')['model']
+        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu', weights_only=False)['model']
         from collections import OrderedDict
         _ignorekeywordlist = args.finetune_ignore if args.finetune_ignore else []
         ignorelist = []
@@ -308,9 +382,6 @@ def main(args):
             lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % args.save_checkpoint_interval == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 weights = {
                     'model': model_without_ddp.state_dict(),
@@ -321,6 +392,14 @@ def main(args):
                 }
 
                 utils.save_on_master(weights, checkpoint_path)
+
+            # Keep storage small: remove per-epoch rolling checkpoints if they exist.
+            if utils.is_main_process():
+                for old_ckpt in glob.glob(str(output_dir / "checkpoint[0-9][0-9][0-9][0-9].pth")):
+                    try:
+                        os.remove(old_ckpt)
+                    except OSError:
+                        pass
                 
         # eval
         test_stats, coco_evaluator = evaluate(
@@ -363,6 +442,8 @@ def main(args):
                         tb_writer.add_scalar(k, v, epoch)
                 lr_val = optimizer.param_groups[0]["lr"]
                 tb_writer.add_scalar("train/lr", lr_val, epoch)
+                log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoch)
+                tb_writer.flush()
 
             # for evaluation logs
             if coco_evaluator is not None:

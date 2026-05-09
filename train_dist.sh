@@ -48,5 +48,10 @@ python main.py --config_file "${CFG}" --datasets "${DATASETS}" --output_dir "${O
 # python main.py --config_file config/cfg_odvg.py --datasets config/datasets_mixed_odvg.json --output_dir output --pretrain_model_path content/groundingdino_swint_ogc.pth --options text_encoder_type=content/bert-base-uncased
 
 # With tensorboard:
-# python main.py --config_file config/cfg_odvg.py --datasets config/datasets_mixed_odvg.json --output_dir output --pretrain_model_path content/groundingdino_swint_ogc.pth --options text_encoder_type=content/bert-base-uncased --use_tensorboard --tensorboard_dir output/tensorboard
+# python main.py --config_file config/cfg_odvg.py --datasets config/datasets_mixed_odvg.json --output_dir output --pretrain_model_path content/groundingdino_swint_ogc.pth --options text_encoder_type=content/bert-base-uncased --use_tensorboard --tensorboard_dir output/tensorboard --amp
+# python -m tensorboard.main --logdir output/tensorboard --port 6006
+# python -m tensorboard.main --logdir "C:\Users\kohom\Downloads\Open-GroundingDino\output\tensorboard" --port 6006
+
+# Inference: 
+# python tools/inference_on_a_image.py -c config/cfg_odvg.py -p output/checkpoint_best_regular.pth -i data/surgical_instrument/valid/Replicator_02_rgb_4997.png --closed-set -t "overholt clamp . dissecting scissors . ligature clamp . needle holder . peritoneum clamp . surgical scissors ." -o output/pred_images
 

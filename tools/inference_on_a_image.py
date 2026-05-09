@@ -1,15 +1,16 @@
 import argparse
 import os
+import json
+import ast
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-# please make sure https://github.com/IDEA-Research/GroundingDINO is installed correctly.
-import groundingdino.datasets.transforms as T
-from groundingdino.models import build_model
-from groundingdino.util import box_ops
-from groundingdino.util.slconfig import SLConfig
-from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
+import datasets.transforms as T
+from main import build_model_main
+from util.slconfig import SLConfig
+from util.utils import clean_state_dict
+from groundingdino.util.utils import get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
 
 
@@ -54,13 +55,19 @@ def plot_boxes_to_image(image_pil, tgt):
     return image_pil, mask
 
 
-def load_image(image_path):
+def load_image(image_path, model_args=None):
     # load image
     image_pil = Image.open(image_path).convert("RGB")  # load image
+    resize_scales = [800]
+    resize_max_size = 1333
+    if model_args is not None:
+        resize_scales = getattr(model_args, "data_aug_scales", resize_scales)
+        resize_max_size = getattr(model_args, "data_aug_max_size", resize_max_size)
+    resize_target = max(resize_scales)
 
     transform = T.Compose(
         [
-            T.RandomResize([800], max_size=1333),
+            T.RandomResize([resize_target], max_size=resize_max_size),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
@@ -72,8 +79,8 @@ def load_image(image_path):
 def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     args = SLConfig.fromfile(model_config_path)
     args.device = "cuda" if not cpu_only else "cpu"
-    model = build_model(args)
-    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    model, _, _ = build_model_main(args)
+    checkpoint = torch.load(model_checkpoint_path, map_location="cpu", weights_only=False)
     load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
     print(load_res)
     _ = model.eval()
@@ -114,9 +121,11 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
             else:
                 pred_phrases.append(pred_phrase)
     else:
+        if isinstance(token_spans, str):
+            token_spans = ast.literal_eval(token_spans)
         # given-phrase mode
         positive_maps = create_positive_map_from_span(
-            model.tokenizer(text_prompt),
+            model.tokenizer(caption),
             token_span=token_spans
         ).to(image.device) # n_phrase, 256
 
@@ -168,10 +177,16 @@ if __name__ == "__main__":
                         ")
 
     parser.add_argument("--cpu-only", action="store_true", help="running on cpu only!, default=False")
+    parser.add_argument(
+        "--closed-set",
+        action="store_true",
+        help="force labels to be one of dot-separated prompt phrases (closed-set mode)",
+    )
     args = parser.parse_args()
 
     # cfg
     config_file = args.config_file  # change the path of the model config file
+    model_args = SLConfig.fromfile(config_file)
     checkpoint_path = args.checkpoint_path  # change the path of the model
     image_path = args.image_path
     text_prompt = args.text_prompt
@@ -183,12 +198,34 @@ if __name__ == "__main__":
     # make dir
     os.makedirs(output_dir, exist_ok=True)
     # load image
-    image_pil, image = load_image(image_path)
+    image_pil, image = load_image(image_path, model_args=model_args)
     # load model
     model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
 
     # visualize raw image
     image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
+
+    # Build token spans from dot-separated phrases when using closed-set mode.
+    if args.closed_set and token_spans is None:
+        parts = [p.strip() for p in text_prompt.split(".") if p.strip()]
+        if len(parts) == 0:
+            raise ValueError("--closed-set requires a non-empty dot-separated text prompt")
+        lc_caption = text_prompt.lower()
+        spans = []
+        cursor = 0
+        for phrase in parts:
+            lc_phrase = phrase.lower()
+            start = lc_caption.find(lc_phrase, cursor)
+            if start < 0:
+                start = lc_caption.find(lc_phrase)
+            if start < 0:
+                continue
+            end = start + len(lc_phrase)
+            spans.append([[start, end]])
+            cursor = end
+        if len(spans) == 0:
+            raise ValueError("Failed to derive phrase spans from --text_prompt in --closed-set mode")
+        token_spans = spans
 
     # set the text_threshold to None if token_spans is set.
     if token_spans is not None:
@@ -211,4 +248,31 @@ if __name__ == "__main__":
     image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
     save_path = os.path.join(output_dir, "pred.jpg")
     image_with_box.save(save_path)
+
+    # Save and print per-box confidence details.
+    predictions = []
+    for box, phrase in zip(boxes_filt.tolist(), pred_phrases):
+        confidence = None
+        label = phrase
+        if "(" in phrase and phrase.endswith(")"):
+            cut = phrase.rfind("(")
+            label = phrase[:cut].strip()
+            conf_str = phrase[cut + 1 : -1]
+            try:
+                confidence = float(conf_str)
+            except ValueError:
+                confidence = None
+        predictions.append(
+            {
+                "label": label,
+                "confidence": confidence,
+                "bbox_xywh_normalized": [float(v) for v in box],
+            }
+        )
+    pred_json_path = os.path.join(output_dir, "predictions.json")
+    with open(pred_json_path, "w", encoding="utf-8") as f:
+        json.dump(predictions, f, ensure_ascii=False, indent=2)
+    print("\nPer-box predictions:")
+    for idx, item in enumerate(predictions, start=1):
+        print(f"{idx}. label={item['label']}, confidence={item['confidence']}, bbox={item['bbox_xywh_normalized']}")
     print(f"\n======================\n{save_path} saved.\nThe program runs successfully!")
