@@ -4,35 +4,36 @@ import json
 import random
 import re
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from util.slconfig import SLConfig
 
 
-DEFAULT_CATEGORIES = {
-    1: "clamp overholt geissend",
-    2: "dissecting scissor",
-    3: "ligature clamp debakey",
-    4: "needle holder debakey",
-    5: "peritoneum clamp baby mikulicz",
-    6: "surgical scissor",
-}
+def normalize_label_name(name: str) -> str:
+    s = str(name).strip().lower()
+    s = s.replace("_", " ").replace("-", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def categories_from_cfg(cfg_path: Path):
-    cfg = SLConfig.fromfile(str(cfg_path))
-    if not hasattr(cfg, "label_list"):
-        raise ValueError(f"'label_list' not found in cfg: {cfg_path}")
-    label_list = list(cfg.label_list)
-    return {i + 1: name for i, name in enumerate(label_list)}
+def load_label_map(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    id_to_name = {int(k): str(v) for k, v in data.items()}
+    # COCO category id is 1-based
+    return {i + 1: id_to_name[i] for i in sorted(id_to_name.keys())}
+
+
+def load_label_conversion(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    # normalized raw name -> normalized canonical name
+    return {normalize_label_name(k): normalize_label_name(v) for k, v in data.items()}
 
 
 def parse_name(path: Path, kind: str):
-    # Matches names like:
-    # Replicator_01_rgb_0188.png
-    # Replicator_01_bounding_box_2d_tight_0188.npy
     pattern = rf"^(?P<prefix>.+)_{kind}_(?P<frame>\d+)\.(png|npy)$"
     match = re.match(pattern, path.name)
     if not match:
@@ -71,10 +72,51 @@ def coco_categories(category_map):
     ]
 
 
-def convert_subset(pairs, dataset_root: Path, category_map, images_root: Path):
+def label_json_for_npy(npy_path: Path):
+    # Replicator_03_bounding_box_2d_tight_4999.npy
+    # -> Replicator_03_bounding_box_2d_tight_labels_4999.json
+    m = re.match(r"^(?P<prefix>.+)_bounding_box_2d_tight_(?P<frame>\d+)\.npy$", npy_path.name)
+    if not m:
+        return None
+    return npy_path.parent / f"{m.group('prefix')}_bounding_box_2d_tight_labels_{m.group('frame')}.json"
+
+
+def load_semantic_names(label_json_path: Path):
+    if label_json_path is None or (not label_json_path.exists()):
+        return {}
+    with label_json_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    out = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                if isinstance(v, dict):
+                    if "class" in v:
+                        name = v["class"]
+                    elif "name" in v:
+                        name = v["name"]
+                    elif "label" in v:
+                        name = v["label"]
+                    else:
+                        name = str(v)
+                else:
+                    name = v
+                out[int(k)] = str(name)
+            except Exception:
+                continue
+    return out
+
+
+def convert_subset(pairs, category_map, images_root: Path, label_conversion: dict):
     images = []
     annotations = []
     ann_id = 1
+    unknown_raw_names = defaultdict(int)
+    missing_label_json = 0
+
+    canonical_norm_to_cat_id = {
+        normalize_label_name(name): cid for cid, name in category_map.items()
+    }
 
     for image_id, (img_path, npy_path) in enumerate(
         tqdm(pairs, desc=f"Converting {images_root.name}", unit="img"), start=1
@@ -91,10 +133,24 @@ def convert_subset(pairs, dataset_root: Path, category_map, images_root: Path):
             }
         )
 
+        label_json_path = label_json_for_npy(npy_path)
+        sid_to_name = load_semantic_names(label_json_path)
+        if len(sid_to_name) == 0:
+            missing_label_json += 1
+
         records = np.load(npy_path, allow_pickle=False)
         for rec in records:
-            cat_id = int(rec["semanticId"])
-            if cat_id not in category_map:
+            sid = int(rec["semanticId"])
+            raw_name = sid_to_name.get(sid, None)
+            if raw_name is None:
+                unknown_raw_names[f"id:{sid}"] += 1
+                continue
+
+            raw_norm = normalize_label_name(raw_name)
+            mapped_norm = label_conversion.get(raw_norm, raw_norm)
+            cat_id = canonical_norm_to_cat_id.get(mapped_norm, None)
+            if cat_id is None:
+                unknown_raw_names[raw_name] += 1
                 continue
 
             x_min = float(rec["x_min"])
@@ -102,7 +158,6 @@ def convert_subset(pairs, dataset_root: Path, category_map, images_root: Path):
             x_max = float(rec["x_max"])
             y_max = float(rec["y_max"])
 
-            # Clamp to image bounds to avoid invalid boxes.
             x_min = max(0.0, min(x_min, width - 1))
             y_min = max(0.0, min(y_min, height - 1))
             x_max = max(0.0, min(x_max, width - 1))
@@ -129,7 +184,7 @@ def convert_subset(pairs, dataset_root: Path, category_map, images_root: Path):
         "images": images,
         "annotations": annotations,
         "categories": coco_categories(category_map),
-    }
+    }, dict(unknown_raw_names), missing_label_json
 
 
 def materialize_split(split_pairs, split_dir: Path):
@@ -139,16 +194,14 @@ def materialize_split(split_pairs, split_dir: Path):
     for img_src, npy_src in tqdm(split_pairs, desc=f"Copying {split_dir.name}", unit="img"):
         img_dst = split_dir / img_src.name
         shutil.copy2(img_src, img_dst)
-        # Keep annotations sourced from original npy; do not copy npy into split folders.
+        # Keep raw npy source unchanged and do not copy to split folder.
         new_pairs.append((img_dst, npy_src))
 
     return new_pairs
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        "Convert Isaac Sim dataset to COCO and split train/val."
-    )
+    parser = argparse.ArgumentParser("Convert Isaac Sim dataset to COCO and split train/val.")
     parser.add_argument(
         "--dataset-root",
         type=Path,
@@ -161,46 +214,32 @@ def main():
         default=Path("./data/surgical_instrument/annotations"),
         help="Output directory for train.json and val.json",
     )
-    parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.8,
-        help="Train split ratio (0-1), default 0.8",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducible split",
-    )
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="Train split ratio (0-1), default 0.8")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible split")
     parser.add_argument(
         "--split-root",
         type=Path,
         default=None,
         help="Root directory to create train/ and valid/ folders (default: <dataset-root>)",
     )
-    parser.add_argument(
-        "--train-split-name",
-        type=str,
-        default="train",
-        help="Folder name for train split, default 'train'",
-    )
-    parser.add_argument(
-        "--val-split-name",
-        type=str,
-        default="valid",
-        help="Folder name for validation split, default 'valid' (Aquarium style)",
-    )
+    parser.add_argument("--train-split-name", type=str, default="train", help="Folder name for train split")
+    parser.add_argument("--val-split-name", type=str, default="valid", help="Folder name for validation split")
     parser.add_argument(
         "--write-split-coco",
         action="store_true",
-        help="Write COCO annotations into split folders as _annotations.coco.json (Aquarium style)",
+        help="Write COCO annotations into split folders as _annotations.coco.json",
     )
     parser.add_argument(
-        "--cfg",
+        "--label-map",
         type=Path,
-        default=None,
-        help="Optional cfg path. If set, categories are built from cfg.label_list (1-based ids).",
+        default=Path("config/label.json"),
+        help="Canonical label map JSON (id->name), e.g. config/label.json",
+    )
+    parser.add_argument(
+        "--label-conversion",
+        type=Path,
+        default=Path("config/label_conversion.json"),
+        help="Raw-name to canonical-name conversion JSON",
     )
     args = parser.parse_args()
 
@@ -228,10 +267,15 @@ def main():
     train_pairs = materialize_split(train_pairs, train_img_dir)
     val_pairs = materialize_split(val_pairs, val_img_dir)
 
-    category_map = categories_from_cfg(args.cfg) if args.cfg else DEFAULT_CATEGORIES
+    category_map = load_label_map(args.label_map)
+    label_conversion = load_label_conversion(args.label_conversion)
 
-    train_coco = convert_subset(train_pairs, args.dataset_root, category_map, train_img_dir)
-    val_coco = convert_subset(val_pairs, args.dataset_root, category_map, val_img_dir)
+    train_coco, train_unknown, train_missing_label_json = convert_subset(
+        train_pairs, category_map, train_img_dir, label_conversion
+    )
+    val_coco, val_unknown, val_missing_label_json = convert_subset(
+        val_pairs, category_map, val_img_dir, label_conversion
+    )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train_out = args.output_dir / "train.json"
@@ -256,6 +300,18 @@ def main():
     print(f"Missing npy for rgb files: {missing_bbox}")
     print(f"Train images copied to: {train_img_dir}")
     print(f"Val images copied to: {val_img_dir}")
+    print(f"Missing per-frame label json (train/val): {train_missing_label_json}/{val_missing_label_json}")
+
+    merged_unknown = defaultdict(int)
+    for k, v in train_unknown.items():
+        merged_unknown[k] += v
+    for k, v in val_unknown.items():
+        merged_unknown[k] += v
+    if merged_unknown:
+        print("Unknown/unmapped raw labels (top 20):")
+        for k, v in sorted(merged_unknown.items(), key=lambda x: x[1], reverse=True)[:20]:
+            print(f"  {k}: {v}")
+
     print(f"Wrote: {train_out}")
     print(f"Wrote: {val_out}")
     if args.write_split_coco:

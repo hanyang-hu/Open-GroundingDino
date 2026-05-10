@@ -2,10 +2,12 @@ import argparse
 import os
 import json
 import ast
+import sys
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import datasets.transforms as T
 from main import build_model_main
 from util.slconfig import SLConfig

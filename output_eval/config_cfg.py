@@ -1,14 +1,10 @@
-# data_aug_scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
-# data_aug_max_size = 1333
-# data_aug_scales2_resize = [400, 500, 600]
-# data_aug_scales2_crop = [384, 600]
 data_aug_scales = [240]
 data_aug_max_size = 320
 data_aug_scales2_resize = [240]
 data_aug_scales2_crop = [240, 240]
 data_aug_scale_overlap = None
 enable_data_aug = False
-batch_size = 8 # for local test, set higher for actual training
+batch_size = 8
 modelname = 'groundingdino'
 backbone = 'swin_T_224_1k'
 position_embedding = 'sine'
@@ -22,7 +18,7 @@ dim_feedforward = 2048
 hidden_dim = 256
 dropout = 0.0
 nheads = 8
-num_queries = 900 
+num_queries = 900
 query_dim = 4
 num_patterns = 0
 num_feature_levels = 4
@@ -40,8 +36,7 @@ dn_bbox_coef = 1.0
 embed_init_tgt = True
 dn_labelbook_size = 91
 max_text_len = 256
-# text_encoder_type = "bert-base-uncased"
-text_encoder_type = "content/bert-base-uncased"
+text_encoder_type = 'content/bert-base-uncased'
 use_text_enhancer = True
 use_fusion_layer = True
 use_checkpoint = True
@@ -51,11 +46,11 @@ text_dropout = 0.0
 fusion_dropout = 0.0
 fusion_droppath = 0.1
 sub_sentence_present = True
-max_labels = 50                               # pos + neg
-lr = 0.0001                                   # base learning rate
-backbone_freeze_keywords = None               # only for gdino backbone
-freeze_keywords = []                    # for whole model, e.g. ['backbone.0', 'bert'] for freeze visual encoder and text encoder
-lr_backbone = 1e-05                           # specific learning rate
+max_labels = 50
+lr = 0.0001
+backbone_freeze_keywords = None
+freeze_keywords = []
+lr_backbone = 1e-05
 lr_backbone_names = ['backbone.0', 'bert']
 lr_linear_proj_mult = 1e-05
 lr_linear_proj_names = ['ref_point_head', 'sampling_offsets']
@@ -113,8 +108,6 @@ matcher_type = 'HungarianMatcher'
 decoder_module_seq = ['sa', 'ca', 'ffn']
 nms_iou_threshold = -1
 dec_pred_class_embed_share = True
-
-
 match_unstable_error = True
 use_ema = False
 ema_decay = 0.9997
@@ -122,11 +115,7 @@ ema_epoch = 0
 use_detached_boxes_dec_out = False
 use_coco_eval = False
 label_list = [
-    "overholt clamp",
-    "dissecting scissors",
-    "ligature clamp",
-    "needle holder",
-    "peritoneum clamp",
-    "surgical scissors",
+    'overholt clamp', 'dissecting scissors', 'ligature clamp', 'needle holder',
+    'peritoneum clamp', 'surgical scissors'
 ]
 dn_scalar = 50
