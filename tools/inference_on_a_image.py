@@ -83,7 +83,27 @@ def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     args.device = "cuda" if not cpu_only else "cpu"
     model, _, _ = build_model_main(args)
     checkpoint = torch.load(model_checkpoint_path, map_location="cpu", weights_only=False)
-    load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+    state_dict = clean_state_dict(checkpoint["model"])
+
+    lora_enabled = bool(getattr(args, "lora_enabled", False))
+    state_looks_lora = any(("lora_" in k) or (".base_model.model." in k) for k in state_dict.keys())
+    if state_looks_lora:
+        from models.GroundingDINO.groundingdino import apply_lora_if_enabled
+        # Force-enable LoRA path for LoRA-formatted checkpoints even if config says disabled.
+        if not lora_enabled:
+            print("Detected LoRA-formatted checkpoint while config has lora_enabled=False. Enabling LoRA wrappers for inference loading.")
+            setattr(args, "lora_enabled", True)
+        print("Detected LoRA-formatted checkpoint. Applying LoRA wrappers before loading weights for inference.")
+        model = apply_lora_if_enabled(model, args)
+
+    load_res = model.load_state_dict(state_dict, strict=False)
+
+    # If inference config enables LoRA but checkpoint is non-LoRA, apply wrappers after base load.
+    if lora_enabled and not getattr(model, "_lora_enabled", False):
+        from models.GroundingDINO.groundingdino import apply_lora_if_enabled
+        print("Applying LoRA wrappers after base-model weight loading for inference.")
+        model = apply_lora_if_enabled(model, args)
+
     print(load_res)
     _ = model.eval()
     return model

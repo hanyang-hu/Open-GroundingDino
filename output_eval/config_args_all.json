@@ -10,7 +10,7 @@
   "note": "",
   "device": "cuda",
   "seed": 42,
-  "resume": "output2/checkpoint_best_regular.pth",
+  "resume": "output2/checkpoint.pth",
   "pretrain_model_path": null,
   "finetune_ignore": null,
   "start_epoch": 0,
@@ -91,7 +91,10 @@
   "max_labels": 50,
   "lr": 0.0001,
   "backbone_freeze_keywords": null,
-  "freeze_keywords": [],
+  "freeze_keywords": [
+    "backbone.0",
+    "bert"
+  ],
   "lr_backbone": 1e-05,
   "lr_backbone_names": [
     "backbone.0",
@@ -102,11 +105,21 @@
     "ref_point_head",
     "sampling_offsets"
   ],
+  "lora_enabled": true,
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.05,
+  "lora_components": [
+    "backbone",
+    "bert"
+  ],
+  "lora_target_modules": [],
+  "lora_extra_target_modules": [],
   "weight_decay": 0.0001,
   "param_dict_type": "ddetr_in_mmdet",
   "ddetr_lr_param": false,
-  "epochs": 5,
-  "lr_drop": 4,
+  "epochs": 10,
+  "lr_drop": 7,
   "save_checkpoint_interval": 1,
   "clip_max_norm": 0.1,
   "onecyclelr": false,
@@ -169,6 +182,9 @@
   "ema_epoch": 0,
   "use_detached_boxes_dec_out": false,
   "use_coco_eval": false,
+  "visualize_eval_outliers": 8,
+  "visualize_eval_best_matches": 8,
+  "visualize_eval_outliers_score_thr": 0.3,
   "label_list": [
     "overholt clamp",
     "dissecting scissors",

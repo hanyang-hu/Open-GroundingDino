@@ -56,4 +56,4 @@ python main.py --config_file "${CFG}" --datasets "${DATASETS}" --output_dir "${O
 # python tools/inference_on_a_image.py -c config/cfg_odvg.py -p output/checkpoint_best_regular.pth -i data/surgical_instrument/valid/Replicator_02_rgb_4997.png --closed-set -t "overholt clamp . dissecting scissors . ligature clamp . needle holder . peritoneum clamp . surgical scissors ." -o output/pred_images
 
 # Test:
-# python main.py --config_file config/cfg_odvg.py --datasets config/datasets_mixed_odvg.json --output_dir output_eval --resume output/checkpoint_best_regular.pth --options text_encoder_type=content/bert-base-uncased --eval --amp
+# python main.py --config_file config/cfg_odvg.py --datasets config/datasets_mixed_odvg.json --output_dir output_eval --resume output/checkpoint.pth --options text_encoder_type=content/bert-base-uncased --eval --amp

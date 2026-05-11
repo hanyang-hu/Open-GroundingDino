@@ -10,7 +10,7 @@
   "note": "",
   "device": "cuda",
   "seed": 42,
-  "resume": "output2/checkpoint_best_regular.pth",
+  "resume": "output2/checkpoint.pth",
   "pretrain_model_path": null,
   "finetune_ignore": null,
   "start_epoch": 0,

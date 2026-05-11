@@ -132,6 +132,10 @@ ema_decay = 0.9997
 ema_epoch = 0
 use_detached_boxes_dec_out = False
 use_coco_eval = False
+# Eval diagnostics (optional)
+visualize_eval_outliers = 8
+visualize_eval_best_matches = 8
+visualize_eval_outliers_score_thr = 0.30
 label_list = [
     "overholt clamp",
     "dissecting scissors",
@@ -140,4 +144,4 @@ label_list = [
     "peritoneum clamp",
     "surgical scissors",
 ]
-dn_scalar = 50
+dn_scalar = 50 # switch to 100 for stable training

@@ -7,15 +7,79 @@ import math
 import os
 import sys
 from typing import Iterable
+from PIL import Image
 
 from util.utils import to_device
 import torch
+from torchvision.utils import draw_bounding_boxes
+from torchvision.ops import box_iou
 
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.cocogrounding_eval import CocoGroundingEvaluator
 
 from datasets.panoptic_eval import PanopticEvaluator
+
+
+def _target_boxes_to_xyxy_abs(tgt_boxes, tgt_size_hw):
+    # tgt_boxes could be normalized cxcywh (common here) or already absolute xyxy.
+    boxes = tgt_boxes.detach().cpu().float().clone()
+    if boxes.numel() == 0:
+        return boxes
+    h = float(tgt_size_hw[0].item() if torch.is_tensor(tgt_size_hw[0]) else tgt_size_hw[0])
+    w = float(tgt_size_hw[1].item() if torch.is_tensor(tgt_size_hw[1]) else tgt_size_hw[1])
+    # Heuristic: if coordinates are in [0, 1.5], assume normalized cxcywh.
+    if float(boxes.max()) <= 1.5:
+        xyxy = boxes.clone()
+        xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2.0) * w
+        xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2.0) * h
+        xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2.0) * w
+        xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2.0) * h
+    else:
+        # Already absolute xyxy.
+        xyxy = boxes
+    xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clamp(0, max(w - 1, 0))
+    xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clamp(0, max(h - 1, 0))
+    return xyxy
+
+
+def _compute_sample_outlier_score(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thr=0.5):
+    # Higher score = worse sample (more errors).
+    if gt_boxes.numel() == 0 and pred_boxes.numel() == 0:
+        return 0.0
+    if gt_boxes.numel() == 0:
+        return float(pred_boxes.shape[0])
+    if pred_boxes.numel() == 0:
+        return float(gt_boxes.shape[0]) * 2.0
+
+    ious = box_iou(gt_boxes, pred_boxes)  # [G, P]
+    missed = 0
+    fp = 0
+    iou_penalty = 0.0
+
+    # Missed GTs (same-label matching).
+    for gi in range(gt_boxes.shape[0]):
+        label_match = (pred_labels == gt_labels[gi])
+        if label_match.any():
+            best_iou = float(ious[gi, label_match].max().item())
+            if best_iou < iou_thr:
+                missed += 1
+            iou_penalty += (1.0 - best_iou)
+        else:
+            missed += 1
+            iou_penalty += 1.0
+
+    # False positives (no same-label gt overlap).
+    for pi in range(pred_boxes.shape[0]):
+        label_match = (gt_labels == pred_labels[pi])
+        if label_match.any():
+            best_iou = float(ious[label_match, pi].max().item())
+            if best_iou < iou_thr:
+                fp += 1
+        else:
+            fp += 1
+
+    return float(missed * 2.0 + fp + 0.2 * iou_penalty)
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -145,6 +209,10 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
     _cnt = 0
     output_state_dict = {} # for debug only
+    outlier_topk = int(getattr(args, "visualize_eval_outliers", 0) or 0)
+    bestmatch_topk = int(getattr(args, "visualize_eval_best_matches", 0) or 0)
+    outlier_score_thr = float(getattr(args, "visualize_eval_outliers_score_thr", 0.30) or 0.30)
+    outlier_records = []
 
     if args.use_coco_eval:
         from pycocotools.coco import COCO
@@ -158,8 +226,16 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     caption = " . ".join(cat_list) + ' .'
     print("Input text prompt:", caption)
 
+    def _label_to_name(lbl):
+        if 0 <= lbl < len(cat_list):
+            return cat_list[lbl]
+        if 1 <= lbl <= len(cat_list):
+            return cat_list[lbl - 1]
+        return str(lbl)
+
     for samples, targets in metric_logger.log_every(data_loader, 10, header, logger=logger):
         samples = samples.to(device)
+        vis_images = samples.tensors.detach().cpu()
 
         targets = [{k: to_device(v, device) for k, v in t.items()} for t in targets]
 
@@ -191,6 +267,69 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 res_pano[i]["file_name"] = file_name
 
             panoptic_evaluator.update(res_pano)
+
+        if outlier_topk > 0:
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=vis_images.dtype).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=vis_images.dtype).view(3, 1, 1)
+            for bi, (tgt, pred) in enumerate(zip(targets, results)):
+                img_id = int(tgt["image_id"].item())
+                oh, ow = int(tgt["orig_size"][0].item()), int(tgt["orig_size"][1].item())
+
+                gt_boxes_xyxy = _target_boxes_to_xyxy_abs(tgt["boxes"], tgt["orig_size"])
+                gt_labels = tgt["labels"].detach().cpu().long()
+
+                pred_scores = pred["scores"].detach().cpu()
+                keep = pred_scores > outlier_score_thr
+                pred_boxes_xyxy = pred["boxes"].detach().cpu()[keep]
+                pred_labels = pred["labels"].detach().cpu().long()[keep]
+                pred_scores = pred_scores[keep]
+
+                score = _compute_sample_outlier_score(
+                    gt_boxes_xyxy, gt_labels, pred_boxes_xyxy, pred_labels
+                )
+
+                # Build display image at transformed size for readable overlays.
+                base_img = (vis_images[bi] * std + mean).clamp(0, 1)
+                base_img = (base_img * 255).to(torch.uint8)
+                h, w = base_img.shape[-2], base_img.shape[-1]
+
+                # Rescale orig-size absolute boxes to displayed size.
+                sx = float(w) / float(max(ow, 1))
+                sy = float(h) / float(max(oh, 1))
+                gt_disp = gt_boxes_xyxy.clone()
+                if gt_disp.numel() > 0:
+                    gt_disp[:, [0, 2]] *= sx
+                    gt_disp[:, [1, 3]] *= sy
+                    gt_disp[:, [0, 2]] = gt_disp[:, [0, 2]].clamp(0, w - 1)
+                    gt_disp[:, [1, 3]] = gt_disp[:, [1, 3]].clamp(0, h - 1)
+                pred_disp = pred_boxes_xyxy.clone()
+                if pred_disp.numel() > 0:
+                    pred_disp[:, [0, 2]] *= sx
+                    pred_disp[:, [1, 3]] *= sy
+                    pred_disp[:, [0, 2]] = pred_disp[:, [0, 2]].clamp(0, w - 1)
+                    pred_disp[:, [1, 3]] = pred_disp[:, [1, 3]].clamp(0, h - 1)
+
+                gt_label_text = [f"gt:{_label_to_name(int(x))}" for x in gt_labels.tolist()]
+                pred_label_text = [
+                    f"pred:{_label_to_name(int(l))}:{float(s):.2f}" for l, s in zip(pred_labels.tolist(), pred_scores.tolist())
+                ]
+
+                gt_img = base_img.clone()
+                if gt_disp.numel() > 0:
+                    gt_img = draw_bounding_boxes(gt_img, gt_disp, labels=gt_label_text, width=2, colors="green")
+                pred_img = base_img.clone()
+                if pred_disp.numel() > 0:
+                    pred_img = draw_bounding_boxes(pred_img, pred_disp, labels=pred_label_text, width=2, colors="red")
+
+                outlier_records.append(
+                    {
+                        "score": float(score),
+                        "image_id": img_id,
+                        "gt_count": int(gt_boxes_xyxy.shape[0]),
+                        "gt_img": gt_img,
+                        "pred_img": pred_img,
+                    }
+                )
         
         if args.save_results:
 
@@ -273,6 +412,33 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
+
+    if (outlier_topk > 0 or bestmatch_topk > 0) and utils.is_main_process():
+        sorted_records = sorted(outlier_records, key=lambda x: x["score"], reverse=True)
+        if outlier_topk > 0:
+            out_dir = os.path.join(output_dir, "eval_outliers")
+            os.makedirs(out_dir, exist_ok=True)
+            top_outliers = sorted_records[:outlier_topk]
+            for rank, rec in enumerate(top_outliers):
+                gt_path = os.path.join(out_dir, f"rank{rank:03d}_img{rec['image_id']}_score{rec['score']:.3f}_gt.jpg")
+                pred_path = os.path.join(out_dir, f"rank{rank:03d}_img{rec['image_id']}_score{rec['score']:.3f}_pred.jpg")
+                Image.fromarray(rec["gt_img"].permute(1, 2, 0).numpy()).save(gt_path)
+                Image.fromarray(rec["pred_img"].permute(1, 2, 0).numpy()).save(pred_path)
+            if logger is not None:
+                logger.info(f"Saved top-{len(top_outliers)} eval outlier visualizations to {out_dir}")
+
+        if bestmatch_topk > 0:
+            best_dir = os.path.join(output_dir, "eval_best_matches")
+            os.makedirs(best_dir, exist_ok=True)
+            best_candidates = [r for r in sorted_records if r.get("gt_count", 0) > 0]
+            top_best = list(reversed(best_candidates[-bestmatch_topk:]))
+            for rank, rec in enumerate(top_best):
+                gt_path = os.path.join(best_dir, f"rank{rank:03d}_img{rec['image_id']}_score{rec['score']:.3f}_gt.jpg")
+                pred_path = os.path.join(best_dir, f"rank{rank:03d}_img{rec['image_id']}_score{rec['score']:.3f}_pred.jpg")
+                Image.fromarray(rec["gt_img"].permute(1, 2, 0).numpy()).save(gt_path)
+                Image.fromarray(rec["pred_img"].permute(1, 2, 0).numpy()).save(pred_path)
+            if logger is not None:
+                logger.info(f"Saved top-{len(top_best)} eval best-match visualizations to {best_dir}")
 
 
 

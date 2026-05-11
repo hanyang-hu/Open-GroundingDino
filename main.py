@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.utils import draw_bounding_boxes
+from PIL import Image
 
 from util.get_param_dicts import get_param_dict
 from util.logger import setup_logger
@@ -151,6 +152,116 @@ def log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoc
             img = draw_bounding_boxes(img, boxes_xyxy, labels=text_labels, width=2)
 
         tb_writer.add_image(f"val/pred_{i}", img, epoch)
+
+
+@torch.no_grad()
+def save_eval_first_batch_visualizations(
+    model,
+    postprocessors,
+    data_loader_val,
+    device,
+    args,
+    output_dir,
+    gt_category_name_by_id=None,
+    max_images=4,
+    score_thr=0.30,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+    caption, cat_list = _build_eval_caption(args)
+
+    try:
+        samples, targets = next(iter(data_loader_val))
+    except StopIteration:
+        return
+
+    samples = samples.to(device)
+    bs = samples.tensors.shape[0]
+    input_captions = [caption] * bs
+    outputs = model(samples, captions=input_captions)
+    orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).to(device)
+    pred_results = postprocessors["bbox"](outputs, orig_target_sizes)
+    vis_images = samples.tensors.detach().cpu()
+
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=vis_images.dtype).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=vis_images.dtype).view(3, 1, 1)
+
+    n_vis = min(max_images, bs)
+
+    def _label_to_name(lbl, names):
+        if 0 <= lbl < len(names):
+            return names[lbl]
+        # Some datasets keep category ids starting at 1.
+        if 1 <= lbl <= len(names):
+            return names[lbl - 1]
+        return str(lbl)
+
+    for i in range(n_vis):
+        img = vis_images[i] * std + mean
+        img = (img.clamp(0, 1) * 255).to(torch.uint8)
+
+        tgt = targets[i]
+        if "size" in tgt:
+            th = int(tgt["size"][0].item() if torch.is_tensor(tgt["size"][0]) else tgt["size"][0])
+            tw = int(tgt["size"][1].item() if torch.is_tensor(tgt["size"][1]) else tgt["size"][1])
+            img = img[:, :th, :tw]
+        h, w = img.shape[-2], img.shape[-1]
+
+        # GT overlay
+        gt_img = img.clone()
+        gt_labels = []
+        if "boxes" in tgt and "labels" in tgt and len(tgt["boxes"]) > 0:
+            gt_boxes = tgt["boxes"].detach().cpu().clone()
+            gt_boxes_xyxy = gt_boxes.clone()
+            gt_boxes_xyxy[:, 0] = (gt_boxes[:, 0] - gt_boxes[:, 2] / 2.0) * w
+            gt_boxes_xyxy[:, 1] = (gt_boxes[:, 1] - gt_boxes[:, 3] / 2.0) * h
+            gt_boxes_xyxy[:, 2] = (gt_boxes[:, 0] + gt_boxes[:, 2] / 2.0) * w
+            gt_boxes_xyxy[:, 3] = (gt_boxes[:, 1] + gt_boxes[:, 3] / 2.0) * h
+            gt_boxes_xyxy[:, [0, 2]] = gt_boxes_xyxy[:, [0, 2]].clamp(0, w - 1)
+            gt_boxes_xyxy[:, [1, 3]] = gt_boxes_xyxy[:, [1, 3]].clamp(0, h - 1)
+
+            for lbl in tgt["labels"].detach().cpu().tolist():
+                ilbl = int(lbl)
+                if gt_category_name_by_id is not None and ilbl in gt_category_name_by_id:
+                    gt_labels.append(gt_category_name_by_id[ilbl])
+                else:
+                    gt_labels.append(_label_to_name(ilbl, cat_list))
+
+            gt_img = draw_bounding_boxes(gt_img, gt_boxes_xyxy, labels=gt_labels, width=2, colors="green")
+
+        # Prediction overlay
+        pred_img = img.clone()
+        p = pred_results[i]
+        pscores = p["scores"].detach().cpu()
+        plabels = p["labels"].detach().cpu()
+        pboxes_xyxy = p["boxes"].detach().cpu()
+        keep = pscores > score_thr
+        pboxes_xyxy = pboxes_xyxy[keep]
+        pscores = pscores[keep]
+        plabels = plabels[keep]
+        if pboxes_xyxy.numel() > 0:
+            # postprocessor boxes are absolute in orig_size coordinates.
+            # Rescale to the displayed image size (which is transformed size, not orig_size).
+            if "orig_size" in tgt:
+                oh = float(tgt["orig_size"][0].item() if torch.is_tensor(tgt["orig_size"][0]) else tgt["orig_size"][0])
+                ow = float(tgt["orig_size"][1].item() if torch.is_tensor(tgt["orig_size"][1]) else tgt["orig_size"][1])
+                if ow > 0 and oh > 0:
+                    sx = float(w) / ow
+                    sy = float(h) / oh
+                    pboxes_xyxy[:, [0, 2]] *= sx
+                    pboxes_xyxy[:, [1, 3]] *= sy
+
+            pboxes_xyxy[:, [0, 2]] = pboxes_xyxy[:, [0, 2]].clamp(0, w - 1)
+            pboxes_xyxy[:, [1, 3]] = pboxes_xyxy[:, [1, 3]].clamp(0, h - 1)
+
+            pred_labels = []
+            for lbl, sc in zip(plabels.tolist(), pscores.tolist()):
+                cls_name = _label_to_name(int(lbl), cat_list)
+                pred_labels.append(f"{cls_name}:{sc:.2f}")
+            pred_img = draw_bounding_boxes(pred_img, pboxes_xyxy, labels=pred_labels, width=2, colors="red")
+
+        Image.fromarray(gt_img.permute(1, 2, 0).numpy()).save(os.path.join(output_dir, f"sample_{i}_gt.jpg"))
+        Image.fromarray(pred_img.permute(1, 2, 0).numpy()).save(os.path.join(output_dir, f"sample_{i}_pred.jpg"))
 
 
 def main(args):
@@ -385,6 +496,29 @@ def main(args):
     
     if args.eval:
         os.environ['EVAL_FLAG'] = 'TRUE'
+        if utils.is_main_process():
+            eval_vis_dir = os.path.join(args.output_dir, "eval_first_batch_vis")
+            gt_category_name_by_id = None
+            try:
+                val_info = dataset_meta["val"][0]
+                if val_info.get("dataset_mode") == "coco":
+                    with open(val_info["anno"], "r", encoding="utf-8") as f:
+                        val_anno = json.load(f)
+                    gt_category_name_by_id = {
+                        int(c["id"]): str(c["name"]) for c in val_anno.get("categories", [])
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to build GT category mapping from val annotation: {e}")
+            save_eval_first_batch_visualizations(
+                model=model,
+                postprocessors=postprocessors,
+                data_loader_val=data_loader_val,
+                device=device,
+                args=args,
+                output_dir=eval_vis_dir,
+                gt_category_name_by_id=gt_category_name_by_id,
+            )
+            logger.info(f"Saved eval first-batch GT/pred visualizations to {eval_vis_dir}")
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir, wo_class_error=wo_class_error, args=args)
         if args.output_dir:
