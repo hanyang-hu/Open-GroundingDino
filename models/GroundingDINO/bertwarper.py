@@ -8,6 +8,7 @@
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+import inspect
 from torch import Tensor, nn
 from torchvision.ops.boxes import nms
 from transformers import BertConfig, BertModel, BertPreTrainedModel
@@ -26,7 +27,53 @@ class BertModelWarper(nn.Module):
 
         self.get_extended_attention_mask = bert_model.get_extended_attention_mask
         self.invert_attention_mask = bert_model.invert_attention_mask
-        self.get_head_mask = bert_model.get_head_mask
+        # transformers API changed across versions; some BertModel builds no longer expose get_head_mask.
+        self.get_head_mask = getattr(bert_model, "get_head_mask", None)
+        try:
+            self._extended_attention_mask_params = set(
+                inspect.signature(self.get_extended_attention_mask).parameters.keys()
+            )
+        except (TypeError, ValueError):
+            self._extended_attention_mask_params = set()
+
+    def _build_extended_attention_mask(self, attention_mask, input_shape, device):
+        # transformers API changed: some versions expect `device`, others expect `dtype`.
+        if "device" in self._extended_attention_mask_params:
+            return self.get_extended_attention_mask(
+                attention_mask, input_shape, device=device
+            )
+
+        dtype = self.embeddings.word_embeddings.weight.dtype
+        if "dtype" in self._extended_attention_mask_params:
+            return self.get_extended_attention_mask(
+                attention_mask, input_shape, dtype=dtype
+            )
+
+        # Last-resort fallbacks for unusual wrappers/signatures.
+        try:
+            return self.get_extended_attention_mask(attention_mask, input_shape, device)
+        except TypeError:
+            return self.get_extended_attention_mask(attention_mask, input_shape, dtype)
+
+    def _build_head_mask(self, head_mask, num_hidden_layers):
+        if self.get_head_mask is not None:
+            return self.get_head_mask(head_mask, num_hidden_layers)
+
+        # Fallback compatible with older ModuleUtilsMixin behavior.
+        if head_mask is None:
+            return [None] * num_hidden_layers
+
+        if head_mask.dim() == 1:
+            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+        elif head_mask.dim() == 2:
+            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        else:
+            raise ValueError(
+                f"head_mask should have dim 1 or 2, got shape={tuple(head_mask.shape)}"
+            )
+
+        return head_mask.to(dtype=torch.float32)
 
     def forward(
         self,
@@ -106,7 +153,7 @@ class BertModelWarper(nn.Module):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
+        extended_attention_mask: torch.Tensor = self._build_extended_attention_mask(
             attention_mask, input_shape, device
         )
 
@@ -128,7 +175,7 @@ class BertModelWarper(nn.Module):
         # attention_probs has shape bsz x n_heads x N x N
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        head_mask = self._build_head_mask(head_mask, self.config.num_hidden_layers)
 
         embedding_output = self.embeddings(
             input_ids=input_ids,

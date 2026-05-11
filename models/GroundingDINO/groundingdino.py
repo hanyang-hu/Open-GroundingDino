@@ -50,6 +50,121 @@ from .utils import MLP, ContrastiveEmbed, sigmoid_focal_loss
 from .matcher import build_matcher
 
 
+def _apply_lora_if_enabled(model, args):
+    if getattr(model, "_lora_enabled", False):
+        return model
+    if not getattr(args, "lora_enabled", False):
+        return model
+
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as e:
+        raise ImportError(
+            "LoRA is enabled but 'peft' is not installed. "
+            "Install it with: pip install peft"
+        ) from e
+
+    lora_r = int(getattr(args, "lora_r", 16))
+    lora_alpha = int(getattr(args, "lora_alpha", 32))
+    lora_dropout = float(getattr(args, "lora_dropout", 0.05))
+    components = set(getattr(args, "lora_components", []) or [])
+    target_modules = list(getattr(args, "lora_target_modules", []) or [])
+    extra_target_modules = list(getattr(args, "lora_extra_target_modules", []) or [])
+
+    component_default_targets = {
+        "backbone": ["qkv", "proj", "fc1", "fc2"],
+        "bert": ["query", "key", "value", "dense"],
+        "transformer": ["q_proj", "k_proj", "v_proj", "out_proj"],
+        "input_proj": ["0"],
+        "feat_map": ["feat_map"],
+        "bbox_embed": ["layers"],
+    }
+    applied_lora = {}
+
+    def _resolve_targets_for_submodule(submodule, requested_targets):
+        # PEFT matches by module name; keep only targets that exist in this submodule.
+        module_names = [n for n, _ in submodule.named_modules()]
+        last_tokens = set()
+        for n in module_names:
+            if not n:
+                continue
+            last_tokens.add(n.split(".")[-1])
+
+        resolved = []
+        for t in requested_targets:
+            if t in last_tokens:
+                resolved.append(t)
+                continue
+            # Also allow full/partial path style requests.
+            if any((n == t) or n.endswith("." + t) or (t in n) for n in module_names):
+                resolved.append(t)
+        return resolved
+
+    def _wrap_with_lora(submodule, targets, component_name):
+        resolved_targets = _resolve_targets_for_submodule(submodule, targets)
+        if not resolved_targets:
+            sample_tokens = sorted({n.split(".")[-1] for n, _ in submodule.named_modules() if n})[:30]
+            raise ValueError(
+                f"LoRA targets {targets} not found for component '{component_name}'. "
+                f"Sample available module tokens: {sample_tokens}"
+            )
+        cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=resolved_targets,
+            bias="none",
+            task_type=None,
+        )
+        applied_lora[component_name] = resolved_targets
+        return get_peft_model(submodule, cfg)
+
+    if "backbone" in components:
+        model.backbone[0] = _wrap_with_lora(
+            model.backbone[0],
+            target_modules or component_default_targets["backbone"],
+            "backbone",
+        )
+    if "bert" in components:
+        model.bert = _wrap_with_lora(
+            model.bert,
+            target_modules or component_default_targets["bert"],
+            "bert",
+        )
+    if "transformer" in components:
+        model.transformer = _wrap_with_lora(
+            model.transformer,
+            target_modules or component_default_targets["transformer"],
+            "transformer",
+        )
+    if "input_proj" in components:
+        model.input_proj = _wrap_with_lora(
+            model.input_proj,
+            target_modules or component_default_targets["input_proj"],
+            "input_proj",
+        )
+    if "feat_map" in components:
+        model = _wrap_with_lora(
+            model, target_modules or component_default_targets["feat_map"], "feat_map"
+        )
+    if "bbox_embed" in components:
+        model.bbox_embed = _wrap_with_lora(
+            model.bbox_embed,
+            target_modules or component_default_targets["bbox_embed"],
+            "bbox_embed",
+        )
+    if extra_target_modules:
+        model = _wrap_with_lora(model, extra_target_modules, "global")
+
+    model._lora_applied = applied_lora
+    model._lora_enabled = True
+    return model
+
+
+def apply_lora_if_enabled(model, args):
+    return _apply_lora_if_enabled(model, args)
+
+
 
 
 class GroundingDINO(nn.Module):
@@ -646,11 +761,14 @@ class PostProcess(nn.Module):
         self.num_select = num_select
         self.tokenizer = get_tokenlizer.get_tokenlizer(text_encoder_type)
         if args.use_coco_eval:
+            raise ValueError("[Error] Do not let use_coco_eval=True in the config!")
             from pycocotools.coco import COCO
             coco = COCO(args.coco_val_path)
             category_dict = coco.loadCats(coco.getCatIds())
             cat_list = [item['name'] for item in category_dict]
         else:
+            print("Label List: ", args.label_list)
+            # input("Press Enter to continue...")
             cat_list=args.label_list
         caption = " . ".join(cat_list) + ' .'
         tokenized = self.tokenizer(caption, padding="longest", return_tensors="pt")
@@ -668,6 +786,9 @@ class PostProcess(nn.Module):
 
         self.nms_iou_threshold=nms_iou_threshold
         self.positive_map = pos_map
+
+        print("Positive map shape: ", pos_map.shape)
+        # input("Press Enter to continue...")
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes, not_to_xyxy=False, test=False):
@@ -755,9 +876,6 @@ def build_groundingdino(args):
         sub_sentence_present=sub_sentence_present,
         max_text_len=args.max_text_len,
     )
-
-
-
     matcher = build_matcher(args)
 
     # prepare weight dict

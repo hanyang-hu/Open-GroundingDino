@@ -54,16 +54,27 @@ sub_sentence_present = True
 max_labels = 50                               # pos + neg
 lr = 0.0001                                   # base learning rate
 backbone_freeze_keywords = None               # only for gdino backbone
-freeze_keywords = []                    # for whole model, e.g. ['backbone.0', 'bert'] for freeze visual encoder and text encoder
+freeze_keywords = ['backbone.0', 'bert']      # for whole model, e.g. ['backbone.0', 'bert'] for freeze visual encoder and text encoder
 lr_backbone = 1e-05                           # specific learning rate
 lr_backbone_names = ['backbone.0', 'bert']
 lr_linear_proj_mult = 1e-05
 lr_linear_proj_names = ['ref_point_head', 'sampling_offsets']
+
+# LoRA (optional, default disabled)
+lora_enabled = True
+lora_r = 8
+lora_alpha = 16
+lora_dropout = 0.05
+# Recommended starter for efficient adaptation:
+lora_components = ['backbone', 'bert']
+lora_target_modules = []
+# Optional extra module name patterns to apply LoRA globally on the full model.
+lora_extra_target_modules = []
 weight_decay = 0.0001
 param_dict_type = 'ddetr_in_mmdet'
 ddetr_lr_param = False
-epochs = 5
-lr_drop = 4
+epochs = 10
+lr_drop = 7
 save_checkpoint_interval = 1
 clip_max_norm = 0.1
 onecyclelr = False

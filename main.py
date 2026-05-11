@@ -231,9 +231,59 @@ def main(args):
     logger.debug("build model ... ...")
     model, criterion, postprocessors = build_model_main(args)
     wo_class_error = False
-    model.to(device)
     logger.debug("build model, done.")
 
+    lora_enabled = bool(getattr(args, "lora_enabled", False))
+
+    def _state_dict_looks_lora(state_dict):
+        return any(("lora_" in k) or (".base_model.model." in k) for k in state_dict.keys())
+
+    from models.GroundingDINO.groundingdino import apply_lora_if_enabled
+    pending_resume_checkpoint = None
+
+    output_dir = Path(args.output_dir)
+    if os.path.exists(os.path.join(args.output_dir, 'checkpoint.pth')):
+        args.resume = os.path.join(args.output_dir, 'checkpoint.pth')
+
+    if args.resume:
+        if args.resume.startswith('https'):
+            pending_resume_checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
+        else:
+            pending_resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        resume_model_state = clean_state_dict(pending_resume_checkpoint['model'])
+
+        if lora_enabled and _state_dict_looks_lora(resume_model_state):
+            logger.info("Detected LoRA-formatted checkpoint. Applying LoRA wrappers before loading resume weights.")
+            model = apply_lora_if_enabled(model, args)
+
+        load_output = model.load_state_dict(resume_model_state, strict=False)
+        logger.info(str(load_output))
+
+    if (not args.resume) and args.pretrain_model_path:
+        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu', weights_only=False)['model']
+        from collections import OrderedDict
+        _ignorekeywordlist = args.finetune_ignore if args.finetune_ignore else []
+        ignorelist = []
+
+        def check_keep(keyname, ignorekeywordlist):
+            for keyword in ignorekeywordlist:
+                if keyword in keyname:
+                    ignorelist.append(keyname)
+                    return False
+            return True
+
+        logger.info("Ignore keys: {}".format(json.dumps(ignorelist, indent=2)))
+        _tmp_st = OrderedDict({k:v for k, v in utils.clean_state_dict(checkpoint).items() if check_keep(k, _ignorekeywordlist)})
+
+        _load_output = model.load_state_dict(_tmp_st, strict=False)
+        logger.info(str(_load_output))
+
+    if lora_enabled and not getattr(model, "_lora_enabled", False):
+        logger.info("Applying LoRA wrappers after base-model checkpoint/pretrain loading.")
+        model = apply_lora_if_enabled(model, args)
+
+    model.to(device)
 
     model_without_ddp = model
     if args.distributed:
@@ -244,16 +294,25 @@ def main(args):
     logger.info('number of params:'+str(n_parameters))
     logger.info("params before freezing:\n"+json.dumps({n: p.numel() for n, p in model.named_parameters() if p.requires_grad}, indent=2))
 
-    param_dicts = get_param_dict(args, model_without_ddp)
-    
-    # freeze some layers
-    if args.freeze_keywords is not None:
+    # freeze some layers (keep LoRA params trainable when LoRA is enabled)
+    freeze_keywords = list(getattr(args, "freeze_keywords", []) or [])
+    if freeze_keywords:
+        sanitized_freeze_keywords = []
+        for keyword in freeze_keywords:
+            if lora_enabled and keyword.startswith("lora_"):
+                logger.warning(f"skip freeze keyword '{keyword}' because LoRA is enabled")
+                continue
+            sanitized_freeze_keywords.append(keyword)
         for name, parameter in model.named_parameters():
-            for keyword in args.freeze_keywords:
+            if lora_enabled and ("lora_" in name or "modules_to_save" in name):
+                continue
+            for keyword in sanitized_freeze_keywords:
                 if keyword in name:
                     parameter.requires_grad_(False)
                     break
     logger.info("params after freezing:\n"+json.dumps({n: p.numel() for n, p in model.named_parameters() if p.requires_grad}, indent=2))
+
+    param_dicts = get_param_dict(args, model_without_ddp)
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
@@ -306,42 +365,21 @@ def main(args):
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
         model_without_ddp.detr.load_state_dict(clean_state_dict(checkpoint['model']),strict=False)
 
-    output_dir = Path(args.output_dir)
-    if os.path.exists(os.path.join(args.output_dir, 'checkpoint.pth')):
-        args.resume = os.path.join(args.output_dir, 'checkpoint.pth')
-    if args.resume:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(clean_state_dict(checkpoint['model']),strict=False)
-
-
-        
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.start_epoch = checkpoint['epoch'] + 1
-
-    if (not args.resume) and args.pretrain_model_path:
-        checkpoint = torch.load(args.pretrain_model_path, map_location='cpu', weights_only=False)['model']
-        from collections import OrderedDict
-        _ignorekeywordlist = args.finetune_ignore if args.finetune_ignore else []
-        ignorelist = []
-
-        def check_keep(keyname, ignorekeywordlist):
-            for keyword in ignorekeywordlist:
-                if keyword in keyname:
-                    ignorelist.append(keyname)
-                    return False
-            return True
-
-        logger.info("Ignore keys: {}".format(json.dumps(ignorelist, indent=2)))
-        _tmp_st = OrderedDict({k:v for k, v in utils.clean_state_dict(checkpoint).items() if check_keep(k, _ignorekeywordlist)})
-
-        _load_output = model_without_ddp.load_state_dict(_tmp_st, strict=False)
-        logger.info(str(_load_output))
+    if not args.eval and pending_resume_checkpoint is not None and 'optimizer' in pending_resume_checkpoint and 'lr_scheduler' in pending_resume_checkpoint and 'epoch' in pending_resume_checkpoint:
+        try:
+            optimizer.load_state_dict(pending_resume_checkpoint['optimizer'])
+            lr_scheduler.load_state_dict(pending_resume_checkpoint['lr_scheduler'])
+            args.start_epoch = pending_resume_checkpoint['epoch'] + 1
+            logger.info(
+                f"Resumed optimizer/scheduler from checkpoint at epoch {pending_resume_checkpoint['epoch']}."
+            )
+        except ValueError as e:
+            logger.warning(
+                "Checkpoint optimizer/scheduler state is incompatible with current run "
+                "(likely different trainable params from LoRA/freeze/config changes). "
+                f"Will load model weights only and restart optimizer/scheduler from scratch. "
+                f"Details: {e}"
+            )
 
  
     
