@@ -226,9 +226,39 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     caption = " . ".join(cat_list) + ' .'
     print("Input text prompt:", caption)
 
-    def _label_to_name(lbl):
+    coco_id_to_name = None
+    if hasattr(base_ds, "cats") and isinstance(base_ds.cats, dict):
+        coco_id_to_name = {int(k): str(v.get("name", k)) for k, v in base_ds.cats.items()}
+
+    def _gt_label_to_name(lbl):
+        # COCO-style targets store category_id directly.
+        if coco_id_to_name is not None and lbl in coco_id_to_name:
+            return coco_id_to_name[lbl]
         if 0 <= lbl < len(cat_list):
             return cat_list[lbl]
+        if 1 <= lbl <= len(cat_list):
+            return cat_list[lbl - 1]
+        return str(lbl)
+
+    def _normalize_gt_label_for_compare(lbl):
+        # Non-COCO-eval path uses 0-based class indices in predictions
+        # while COCO targets are commonly 1-based category ids.
+        if not getattr(args, "use_coco_eval", False):
+            if 1 <= lbl <= len(cat_list):
+                return lbl - 1
+        return lbl
+
+    def _pred_label_to_name(lbl):
+        # In this repo:
+        # - use_coco_eval=False: labels are indices into cat_list.
+        # - use_coco_eval=True: labels are COCO category ids after id_map in PostProcess.
+        if getattr(args, "use_coco_eval", False):
+            if coco_id_to_name is not None and lbl in coco_id_to_name:
+                return coco_id_to_name[lbl]
+        if 0 <= lbl < len(cat_list):
+            return cat_list[lbl]
+        if coco_id_to_name is not None and lbl in coco_id_to_name:
+            return coco_id_to_name[lbl]
         if 1 <= lbl <= len(cat_list):
             return cat_list[lbl - 1]
         return str(lbl)
@@ -284,8 +314,14 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 pred_labels = pred["labels"].detach().cpu().long()[keep]
                 pred_scores = pred_scores[keep]
 
+                gt_labels_for_compare = gt_labels.clone()
+                for gi in range(gt_labels_for_compare.numel()):
+                    gt_labels_for_compare[gi] = _normalize_gt_label_for_compare(
+                        int(gt_labels_for_compare[gi].item())
+                    )
+
                 score = _compute_sample_outlier_score(
-                    gt_boxes_xyxy, gt_labels, pred_boxes_xyxy, pred_labels
+                    gt_boxes_xyxy, gt_labels_for_compare, pred_boxes_xyxy, pred_labels
                 )
 
                 # Build display image at transformed size for readable overlays.
@@ -309,9 +345,10 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                     pred_disp[:, [0, 2]] = pred_disp[:, [0, 2]].clamp(0, w - 1)
                     pred_disp[:, [1, 3]] = pred_disp[:, [1, 3]].clamp(0, h - 1)
 
-                gt_label_text = [f"gt:{_label_to_name(int(x))}" for x in gt_labels.tolist()]
+                gt_label_text = [_gt_label_to_name(int(x)) for x in gt_labels.tolist()]
                 pred_label_text = [
-                    f"pred:{_label_to_name(int(l))}:{float(s):.2f}" for l, s in zip(pred_labels.tolist(), pred_scores.tolist())
+                    f"{_pred_label_to_name(int(l))}:{float(s):.2f}"
+                    for l, s in zip(pred_labels.tolist(), pred_scores.tolist())
                 ]
 
                 gt_img = base_img.clone()
