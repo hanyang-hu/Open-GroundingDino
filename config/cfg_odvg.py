@@ -2,13 +2,13 @@
 # data_aug_max_size = 1333
 # data_aug_scales2_resize = [400, 500, 600]
 # data_aug_scales2_crop = [384, 600]
-data_aug_scales = [240]
-data_aug_max_size = 320
-data_aug_scales2_resize = [240]
-data_aug_scales2_crop = [240, 240]
+data_aug_scales = [480]
+data_aug_max_size = 640
+data_aug_scales2_resize = [480]
+data_aug_scales2_crop = [480, 480]
 data_aug_scale_overlap = None
 enable_data_aug = False
-batch_size = 8 # for local test, set higher for actual training
+batch_size = 16 # for local test, set higher for actual training
 modelname = 'groundingdino'
 backbone = 'swin_T_224_1k'
 position_embedding = 'sine'
@@ -62,8 +62,8 @@ lr_linear_proj_names = ['ref_point_head', 'sampling_offsets']
 
 # LoRA (optional, default disabled)
 lora_enabled = True
-lora_r = 8
-lora_alpha = 16
+lora_r = 16
+lora_alpha = 32
 lora_dropout = 0.05
 # Recommended starter for efficient adaptation:
 lora_components = ['backbone', 'bert']
@@ -73,8 +73,8 @@ lora_extra_target_modules = []
 weight_decay = 0.0001
 param_dict_type = 'ddetr_in_mmdet'
 ddetr_lr_param = False
-epochs = 10
-lr_drop = 7
+epochs = 20
+lr_drop = 16
 save_checkpoint_interval = 1
 clip_max_norm = 0.1
 onecyclelr = False

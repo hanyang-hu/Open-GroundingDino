@@ -101,7 +101,7 @@ def _build_eval_caption(args):
 
 
 @torch.no_grad()
-def log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoch, max_images=4, score_thr=0.30):
+def log_val_visualizations(model, postprocessors, data_loader_val, tb_writer, device, args, epoch, max_images=4, score_thr=0.30):
     if tb_writer is None:
         return
     model.eval()
@@ -116,9 +116,9 @@ def log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoc
     bs = samples.tensors.shape[0]
     input_captions = [caption] * bs
     outputs = model(samples, captions=input_captions)
-
-    pred_logits = outputs["pred_logits"].sigmoid().detach().cpu()  # [B, NQ, 256]
-    pred_boxes = outputs["pred_boxes"].detach().cpu()              # [B, NQ, 4], cxcywh in [0,1]
+    targets = [{k: v for k, v in t.items()} for t in _]
+    orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0).to(device)
+    pred_results = postprocessors["bbox"](outputs, orig_target_sizes)
     vis_images = samples.tensors.detach().cpu()
 
     n_vis = min(max_images, bs)
@@ -130,24 +130,34 @@ def log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoc
         img = (img.clamp(0, 1) * 255).to(torch.uint8)
         h, w = img.shape[-2], img.shape[-1]
 
-        scores, labels = pred_logits[i].max(dim=1)
+        p = pred_results[i]
+        scores = p["scores"].detach().cpu()
+        labels = p["labels"].detach().cpu()
+        boxes_xyxy = p["boxes"].detach().cpu()
         keep = scores > score_thr
-        boxes = pred_boxes[i][keep]
         scores = scores[keep]
         labels = labels[keep]
+        boxes_xyxy = boxes_xyxy[keep]
 
-        if boxes.numel() > 0:
-            boxes_xyxy = boxes.clone()
-            boxes_xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2.0) * w
-            boxes_xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2.0) * h
-            boxes_xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2.0) * w
-            boxes_xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2.0) * h
+        if boxes_xyxy.numel() > 0:
+            # postprocessor boxes are in orig_size coords; rescale to displayed tensor size.
+            oh = float(targets[i]["orig_size"][0].item())
+            ow = float(targets[i]["orig_size"][1].item())
+            if ow > 0 and oh > 0:
+                boxes_xyxy[:, [0, 2]] *= float(w) / ow
+                boxes_xyxy[:, [1, 3]] *= float(h) / oh
             boxes_xyxy[:, [0, 2]] = boxes_xyxy[:, [0, 2]].clamp(0, w - 1)
             boxes_xyxy[:, [1, 3]] = boxes_xyxy[:, [1, 3]].clamp(0, h - 1)
 
             text_labels = []
             for lbl, sc in zip(labels.tolist(), scores.tolist()):
-                cls_name = cat_list[lbl] if 0 <= lbl < len(cat_list) else str(lbl)
+                idx = int(lbl)
+                if 0 <= idx < len(cat_list):
+                    cls_name = cat_list[idx]
+                elif 1 <= idx <= len(cat_list):
+                    cls_name = cat_list[idx - 1]
+                else:
+                    cls_name = str(idx)
                 text_labels.append(f"{cls_name}:{sc:.2f}")
             img = draw_bounding_boxes(img, boxes_xyxy, labels=text_labels, width=2)
 
@@ -614,7 +624,7 @@ def main(args):
                         tb_writer.add_scalar(k, v, epoch)
                 lr_val = optimizer.param_groups[0]["lr"]
                 tb_writer.add_scalar("train/lr", lr_val, epoch)
-                log_val_visualizations(model, data_loader_val, tb_writer, device, args, epoch)
+                log_val_visualizations(model, postprocessors, data_loader_val, tb_writer, device, args, epoch)
                 tb_writer.flush()
 
             # for evaluation logs

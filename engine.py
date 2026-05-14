@@ -226,6 +226,14 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     caption = " . ".join(cat_list) + ' .'
     print("Input text prompt:", caption)
 
+    # For non-COCO-eval closed-set mode, postprocessor labels are 0..N-1 indices.
+    # If validation GT is COCO-style with category ids (often 1..N), remap preds to GT ids.
+    pred_label_id_map = None
+    if not getattr(args, "use_coco_eval", False) and hasattr(base_ds, "cats") and isinstance(base_ds.cats, dict):
+        sorted_cat_ids = sorted(int(k) for k in base_ds.cats.keys())
+        if len(sorted_cat_ids) == len(cat_list):
+            pred_label_id_map = {i: cid for i, cid in enumerate(sorted_cat_ids)}
+
     coco_id_to_name = None
     if hasattr(base_ds, "cats") and isinstance(base_ds.cats, dict):
         coco_id_to_name = {int(k): str(v.get("name", k)) for k, v in base_ds.cats.items()}
@@ -278,6 +286,13 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
         results = postprocessors['bbox'](outputs, orig_target_sizes)
+        if pred_label_id_map is not None:
+            for ri in range(len(results)):
+                lbl = results[ri]["labels"]
+                mapped = lbl.clone()
+                for i in range(lbl.numel()):
+                    mapped[i] = pred_label_id_map.get(int(lbl[i].item()), int(lbl[i].item()))
+                results[ri]["labels"] = mapped
         # [scores: [100], labels: [100], boxes: [100, 4]] x B
         if 'segm' in postprocessors.keys():
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
